@@ -14,7 +14,8 @@ from .reverse_geocode import (
     ReverseGeoCodeTool,
 )
 from .sde_search import (
-    SDEDocument,
+    NormalizedDocument,
+    SDESearchFilters,
     SDESearchTool,
     SDESearchToolConfig,
     SDESearchToolInputSchema,
@@ -49,7 +50,8 @@ __all__ = [
     "SDESearchToolInputSchema",
     "SDESearchToolOutputSchema",
     "SDESearchToolConfig",
-    "SDEDocument",
+    "SDESearchFilters",
+    "NormalizedDocument",
     "CodeSignalsSearchInputSchema",
     "CodeSignalsSearchOutputSchema",
     "CodeSignalsSearchTool",
