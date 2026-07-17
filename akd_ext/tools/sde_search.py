@@ -1,312 +1,542 @@
-"""
-NASA Science Discovery Engine (SDE) search tool.
+"""NASA Science Discovery Engine (SDE) search tool.
 
-This tool wraps the SDE Elastic Wrapper API to enable searching NASA's Science
-Discovery Engine for relevant scientific documents, datasets, and resources using
-natural language queries.
+This module implements ``sde_search`` — the SDE MCP search contract. It retrieves
+SDE-indexed content, normalizes source-specific records into a stable document
+contract, and applies deterministic citation normalization to every returned
+document.
+
+Design notes:
+- The tool executes a validated SDE Search API request against the cross-source
+  ``generic`` endpoint or a caller-selected source endpoint.
+- Citation normalization runs automatically for every returned document, adding four
+  fields (``citation_type``, ``citation_value``, ``fallback_used``, ``citation_status``)
+  selected by a fixed identifier hierarchy (DOI → pds_lid → ivo_id → bps_osdr_id →
+  url → missing). There is no separate citation-lookup operation: the SDE Search API
+  has no lookup-by-identifier endpoint, so citations are only produced from search
+  results, where every field the hierarchy needs is already present.
+- The tool never fabricates results or identifiers. Upstream and validation failures
+  are returned as a structured payload (``success=false``) rather than raised past the
+  MCP boundary, so the agent-facing contract stays stable and actionable.
+
+Boundaries: summarization, query rewriting, acronym expansion, ranking, and internal
+registry operations live in the agent/application layer, not in this tool.
 """
 
-import asyncio
 import os
+import re
+
 import httpx
-from akd._base import InputSchema
-from akd.tools.search import SearchToolOutputSchema
-from akd.structures import SearchResult
-from akd.tools import BaseTool, BaseToolConfig
-from pydantic import Field
-from typing import Literal
 from loguru import logger
+from pydantic import BaseModel, Field, model_validator
+
+from akd._base import InputSchema, OutputSchema
+from akd.tools import BaseTool, BaseToolConfig
 
 from akd_ext.mcp import mcp_tool
-from akd_ext.structures import SDEIndexedDocumentType, NASASMDDivision
+from akd_ext.structures import (
+    SDECitationStatus,
+    SDECitationType,
+    SDEErrorType,
+    SDESearchEndpoint,
+    SDESearchType,
+)
+
+# Maps the caller-facing endpoint enum to the SDE Search API path.
+ENDPOINT_PATHS: dict[SDESearchEndpoint, str] = {
+    SDESearchEndpoint.GENERIC: "/api/search",
+    SDESearchEndpoint.WEB: "/api/web/search",
+    SDESearchEndpoint.CMR: "/api/cmr/search",
+    SDESearchEndpoint.PDS3: "/api/pds3/search",
+    SDESearchEndpoint.PDS4: "/api/pds4/search",
+    SDESearchEndpoint.SPASE: "/api/spase/search",
+    SDESearchEndpoint.GCN: "/api/gcn/search",
+    SDESearchEndpoint.HEK: "/api/hek/search",
+    SDESearchEndpoint.NAVO: "/api/navo/search",
+    SDESearchEndpoint.OSDR: "/api/osdr/search",
+    SDESearchEndpoint.CODE: "/api/code/search",
+}
+
+# A DOI is `10.<registrant>/<suffix>`, optionally wrapped in a URL/`doi:` prefix.
+# The suffix stops at whitespace or a `;`/`,` delimiter — some SDE persistent_id
+# fields pack multiple DOIs as `10.x/a;10.y/b`, and only the first is selected.
+_DOI_CORE = re.compile(r"10\.\d{4,9}/[^\s;,]+", re.IGNORECASE)
+
+
+def _extract_doi(value: str | None) -> str | None:
+    """Return a bare DOI string if ``value`` contains a valid DOI, else ``None``.
+
+    Recognizes DOIs wrapped as ``https://doi.org/...``, ``doi:...``, or bare, and
+    selects the first when a field packs several. A non-DOI persistent identifier
+    must never be classified as a DOI, so this only matches the ``10.xxxx/...`` shape.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    match = _DOI_CORE.search(value.strip())
+    if not match:
+        return None
+    # Trim trailing punctuation that commonly rides along in free-text fields.
+    return match.group(0).rstrip(".,;)")
+
+
+class SDESearchFilters(BaseModel):
+    """Supported SDE search filters.
+
+    OR semantics apply within each list; AND semantics apply between groups.
+    Only these four filter fields are supported by the contract.
+    """
+
+    division: list[str] | None = Field(
+        default=None,
+        description="Filter by NASA SMD division (e.g. 'Astrophysics', 'Planetary Science').",
+    )
+    document_type: list[str] | None = Field(
+        default=None,
+        description="Filter by document type (e.g. 'Data', 'Documentation', 'Software and Tools').",
+    )
+    collection_name: list[str] | None = Field(
+        default=None, description="Filter by human-readable collection name."
+    )
+    collection_key: list[str] | None = Field(
+        default=None, description="Filter by internal collection key."
+    )
+
+    def to_api_payload(self) -> dict:
+        """Serialize only the populated filter groups for the API request body."""
+        return {k: v for k, v in self.model_dump().items() if v}
+
+
+class NormalizedDocument(BaseModel):
+    """A single SDE document normalized into the stable contract.
+
+    Source-specific fields remain available in ``raw_response``; this model holds
+    the fields common across index types plus the four citation fields that are
+    added deterministically to every document.
+    """
+
+    id: str = Field(default="", description="Normalized document identifier.")
+    score: float = Field(default=0.0, description="Relevance score from the search engine.")
+    index: str = Field(default="", description="Source index the record came from.")
+    title: str = Field(default="", description="Document or dataset title.")
+    url: str = Field(default="", description="Direct URL to access the document.")
+    division: str = Field(default="", description="NASA SMD division.")
+    document_type: str = Field(default="", description="Document type.")
+    collection_name: str = Field(default="", description="Collection name.")
+    collection_key: str = Field(default="", description="Internal collection key.")
+    full_text: str = Field(default="", description="Full text or abstract, when available.")
+    data_product_desc: str = Field(default="", description="Data product description, when available.")
+    relevant_content: str = Field(default="", description="Most relevant snippet for the query.")
+    highlights: list[str] = Field(default_factory=list, description="Highlighted matching fragments.")
+    persistent_id: str = Field(default="", description="Persistent identifier (may hold a DOI).")
+    pds_lid: str = Field(default="", description="PDS logical identifier, when available.")
+    ivo_id: str = Field(default="", description="IVOA identifier, when available.")
+    bps_osdr_id: str = Field(default="", description="BPS/OSDR identifier, when available.")
+
+    # Citation fields — added deterministically to every document.
+    citation_type: SDECitationType = Field(
+        default=SDECitationType.MISSING, description="Identifier type selected by the hierarchy."
+    )
+    citation_value: str = Field(default="", description="Selected DOI, identifier, or URL.")
+    fallback_used: bool = Field(
+        default=False, description="True when a lower-priority identifier or URL was selected."
+    )
+    citation_status: SDECitationStatus = Field(
+        default=SDECitationStatus.MISSING, description="Availability/quality of the citation."
+    )
+
+
+def normalize_citation(doc: NormalizedDocument) -> None:
+    """Apply the deterministic citation hierarchy to ``doc`` in place.
+
+    Hierarchy (first valid, non-empty value wins):
+      1. DOI (from ``persistent_id`` or another DOI-bearing field)
+      2. ``pds_lid``
+      3. ``ivo_id``
+      4. ``bps_osdr_id``
+      5. external ``url``
+      6. missing
+
+    A DOI yields ``complete``/``fallback_used=False``; a lower-priority value
+    yields ``fallback``/``fallback_used=True``; no value yields ``missing``.
+    Identifiers are never fabricated or inferred.
+    """
+    doi = _extract_doi(doc.persistent_id)
+    if doi:
+        doc.citation_type = SDECitationType.DOI
+        doc.citation_value = doi
+        doc.citation_status = SDECitationStatus.COMPLETE
+        doc.fallback_used = False
+        return
+
+    for value, ctype in (
+        (doc.pds_lid, SDECitationType.PDS_LID),
+        (doc.ivo_id, SDECitationType.IVO_ID),
+        (doc.bps_osdr_id, SDECitationType.BPS_OSDR_ID),
+        (doc.url, SDECitationType.URL),
+    ):
+        if value:
+            doc.citation_type = ctype
+            doc.citation_value = value
+            doc.citation_status = SDECitationStatus.FALLBACK
+            doc.fallback_used = True
+            return
+
+    doc.citation_type = SDECitationType.MISSING
+    doc.citation_value = ""
+    doc.citation_status = SDECitationStatus.MISSING
+    doc.fallback_used = False
 
 
 class SDESearchToolConfig(BaseToolConfig):
-    """Configuration for the SDE Search Tool."""
+    """Instance-time configuration for the SDE search tool."""
 
+    name: str = Field(default="sde_search", description="MCP tool name.")
     base_url: str = Field(
-        default=os.getenv("SDE_BASE_URL", "https://d2kqty7z3q8ugg.cloudfront.net"),
-        description="Base URL for the SDE API",
+        default=os.getenv(
+            "SDE_BASE_URL", "https://science.data.nasa.gov/science-discovery-engine"
+        ),
+        description="Base URL for the SDE Search API (endpoint paths like /api/search are appended).",
     )
-    timeout: float = Field(
-        default=30.0,
-        description="HTTP request timeout in seconds",
-    )
-    division: NASASMDDivision | None = Field(
-        None,
-        description="Filter results by NASA SMD division",
-    )
-    search_type: Literal["hybrid", "vector", "keyword"] = Field(
-        default="hybrid",
-        description="Search type: 'hybrid' (vector + keyword), 'vector' (semantic), 'keyword' (text-based)",
-    )
-    validate_urls: bool = Field(
-        default=False,
-        description="Validate document URLs with HTTP HEAD requests to filter out 404s",
-    )
-    url_check_timeout: float = Field(
-        default=5.0,
-        description="Timeout for individual URL validation requests in seconds",
-    )
-    result_multiplier: float = Field(
-        default=2.0,
-        ge=1.0,
-        le=10.0,
-        description="Multiplier for initial results to fetch (e.g., 2.0 fetches 2x limit from API before filtering)",
-    )
+    timeout: float = Field(default=30.0, description="HTTP request timeout in seconds.")
 
 
-class SDEDocument(SearchResult):
-    """
-    A single document result from SDE search.
-
-    Extends SearchResult with SDE-specific fields. Parsed from the HitBase structure
-    returned by the SDE Elastic Wrapper API. Maps common fields from multiple index
-    types (web, CMR, PDS3/4, SPASE, GCN, etc.) into a unified structure.
-
-    Common fields inherited from SearchResult:
-    - query: Search query that produced this result
-    - title: Document title
-    - content: Snippet or abstract (mapped from snippet field)
-    - score: Relevance score from OpenSearch
-    """
-
-    url: str = Field(..., description="URL to access the document")
-    division: NASASMDDivision | None = Field(
-        None, description="NASA SMD division (e.g., Astrophysics, Planetary Science)"
-    )
-    doc_type: SDEIndexedDocumentType | None = Field(
-        None, description="Document type (e.g., Data, Documentation, Software and Tools)"
-    )
-    source: str | None = Field(None, description="Source index (e.g., sde-web, sde-cmr, sde-pds4, sde-code)")
-
-
-# cannot use SearchToolInputSchema because it has plural 'queries' field
 class SDESearchToolInputSchema(InputSchema):
-    """Input schema for SDE search queries."""
+    """Request for an ``sde_search`` query."""
 
-    query: str = Field(..., description="Natural language search query")
-    limit: int = Field(default=10, ge=1, le=100, description="Maximum number of results to return")
-
-    doc_type: SDEIndexedDocumentType | None = Field(
-        None,
-        description="Filter results by document type",
+    search_term: str = Field(
+        ...,
+        min_length=1,
+        description="Search query. Must not be blank.",
+    )
+    endpoint: SDESearchEndpoint = Field(
+        default=SDESearchEndpoint.GENERIC,
+        description="Search endpoint. 'generic' is cross-source; other values target one source.",
+    )
+    search_type: SDESearchType = Field(
+        default=SDESearchType.HYBRID,
+        description="Retrieval strategy: 'hybrid' (vector+keyword), 'keyword', or 'vector'.",
+    )
+    page: int = Field(default=1, ge=1, description="1-based page number.")
+    page_size: int = Field(default=10, ge=1, le=100, description="Results per page (1-100).")
+    include_aggregations: bool = Field(
+        default=False, description="Request aggregation metadata when available."
+    )
+    filters: SDESearchFilters | None = Field(
+        default=None, description="Optional result filters (OR within a list, AND across groups)."
     )
 
+    @model_validator(mode="after")
+    def _search_term_not_blank(self) -> "SDESearchToolInputSchema":
+        if not self.search_term.strip():
+            raise ValueError("'search_term' must not be blank.")
+        return self
 
-class SDESearchToolOutputSchema(SearchToolOutputSchema):
-    """Output schema for SDE search results."""
 
-    results: list[SDEDocument] = Field(..., description="List of matching documents from SDE")
+class SDESearchToolOutputSchema(OutputSchema):
+    """Response for an ``sde_search`` query.
+
+    A single schema covers both the success and failure contracts so the MCP
+    surface stays stable. ``success`` tells the agent which fields are populated;
+    ``agent_instruction`` is always present.
+    """
+
+    success: bool = Field(..., description="Whether the search succeeded.")
+    agent_instruction: str = Field(..., description="Guidance for the agent on how to use this result.")
+
+    # --- Success ---
+    endpoint_used: str = Field(default="", description="Endpoint value the search executed against.")
+    raw_response: dict = Field(default_factory=dict, description="Unmodified upstream response body.")
+    normalized_documents: list[NormalizedDocument] = Field(
+        default_factory=list, description="Documents normalized into the stable contract."
+    )
+    pagination: dict = Field(default_factory=dict, description="Pagination metadata (page, page_size, total).")
+    aggregations: dict = Field(default_factory=dict, description="Aggregation metadata when requested/available.")
+
+    # --- Failure ---
+    error_type: SDEErrorType | None = Field(default=None, description="Structured error category.")
+    message: str = Field(default="", description="Human-readable error message.")
+    agent_next_action: str = Field(default="", description="Recommended recovery action.")
+    retryable: bool = Field(default=False, description="Whether retrying may succeed.")
+
+
+_SEARCH_INSTRUCTION = (
+    "Use normalized_documents for reasoning, summarization, comparison, and citation. "
+    "Prefer complete or fallback citations. Inspect raw_response only when source-specific "
+    "fields are required."
+)
+_FAILURE_INSTRUCTION = (
+    "Do not fabricate search results or citation identifiers. Follow the recommended recovery action."
+)
 
 
 @mcp_tool
 class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema]):
-    """
-    Search NASA's Science Discovery Engine (SDE) using the unified /api/search endpoint.
+    """Search NASA's Science Discovery Engine (SDE) and return citation-ready results.
 
-    The Science Discovery Engine (SDE) is NASA's centralized search platform that indexes
-    scientific data, publications, and resources from multiple NASA data sources including
-    CMR (Earth observation), PDS (planetary science), SPASE (heliophysics), GCN (astronomy),
-    code repositories, and documentation.
+    The SDE is NASA's centralized platform indexing scientific data, publications, and
+    resources across sources including CMR (Earth observation), PDS (planetary science),
+    SPASE (heliophysics), GCN and HEK (astronomy/solar), NAVO, OSDR (biological/physical
+    sciences), code repositories, and general web documentation.
 
-    This tool uses the /api/search endpoint which provides cross-source search with vector, keyword and hybrid
-    (vector + keyword) semantic search capabilities, returning unified results across all
-    indexed NASA content.
+    Executes keyword, vector, or hybrid retrieval against the cross-source `generic`
+    endpoint or a caller-selected source endpoint, and returns documents normalized into
+    a stable contract. Citation normalization runs automatically for every document.
+    - search_term: the query (required, non-blank)
+    - endpoint: generic | web | cmr | pds3 | pds4 | spase | gcn | hek | navo | osdr | code
+    - search_type: hybrid (default) | keyword | vector
+    - page / page_size: pagination (page >= 1, page_size 1-100)
+    - include_aggregations: request aggregation metadata when available
+    - filters: division, document_type, collection_name, collection_key
+               (OR within a list, AND across groups)
 
-    Input parameters (query-time, LLM-controllable):
-    - query: Natural language search query (e.g., "Mars rover spectroscopy data")
-    - limit: Maximum number of results to return (1-100, default: 10)
-    - doc_type: Optional filter by document type (Data, Documentation, Software and Tools,
-                Images, Missions and Instruments)
+    Every normalized document includes four citation fields, selected deterministically
+    in this order: DOI, pds_lid, ivo_id, bps_osdr_id, url, missing.
+    - citation_type:   doi | pds_lid | ivo_id | bps_osdr_id | url | missing
+    - citation_value:  the selected DOI, identifier, or URL (empty when missing)
+    - fallback_used:   false for a DOI or missing citation; true for a lower-priority identifier/URL
+    - citation_status: complete (DOI) | fallback (lower-priority) | missing (none available)
 
-    Configuration parameters (instance-time, user-controlled):
-    - search_type: Search mode - "hybrid" (default, vector+keyword), "vector" (semantic only),
-                   or "keyword" (text-based only). Fixed at tool instantiation.
-    - division: Optional NASA SMD division filter (Astrophysics, Earth Science, Heliophysics,
-                Planetary Science). If set, all searches are scoped to this division.
-    - validate_urls: Whether to validate result URLs with HTTP HEAD requests (default: False).
-                     Filters out inaccessible resources.
-    - result_multiplier: When validate_urls=True, fetches this multiple of the limit to account
-                        for filtered results (default: 2.0, range: 1.0-10.0)
-    - timeout: HTTP request timeout in seconds (default: 30.0)
-    - url_check_timeout: Timeout for URL validation requests in seconds (default: 5.0)
-
-    Returns documents with:
-    - title: Document or dataset title
-    - url: Direct link to the resource
-    - content: Description, abstract, or relevant text snippet
-    - score: Relevance score from search engine
-    - division: NASA SMD division (Astrophysics, Earth Science, Heliophysics, Planetary Science)
-    - doc_type: Type of document/resource
-    - source: Origin data source (sde-cmr, sde-pds4, sde-web, sde-code, etc.)
+    The tool never fabricates results or identifiers and never drops a valid result because
+    its citation is missing. Failures are returned as a structured payload (`success=false`
+    with `error_type`, `message`, `agent_next_action`, `retryable`) rather than raised, so the
+    agent can recover deterministically. Summarization, query rewriting, acronym expansion,
+    ranking, and internal-registry operations are the agent's responsibility, not this tool's.
     """
 
     input_schema = SDESearchToolInputSchema
     output_schema = SDESearchToolOutputSchema
     config_schema = SDESearchToolConfig
 
-    async def _check_url_exists(self, url: str) -> bool:
-        """
-        Check if a URL is accessible using HTTP HEAD request.
+    # ------------------------------------------------------------------ helpers
 
-        Args:
-            url: The URL to check
+    def _parse_document(self, doc: dict) -> NormalizedDocument:
+        """Normalize one raw SDE record and attach citation fields."""
 
-        Returns:
-            bool: True if URL is accessible (status < 400), False otherwise
-        """
-        if not url:
-            return False
+        def _s(*keys: str) -> str:
+            for key in keys:
+                val = doc.get(key)
+                if val:
+                    return str(val)
+            return ""
 
-        try:
-            async with httpx.AsyncClient(timeout=self.config.url_check_timeout, follow_redirects=True) as client:
-                response = await client.head(url)
-                return response.status_code < 400
-        except Exception as e:
-            logger.debug(f"URL check failed for {url}: {e}")
-            return False
+        highlights = doc.get("highlights") or doc.get("highlight") or []
+        if isinstance(highlights, dict):
+            # OpenSearch-style highlight maps field -> list[str]; flatten.
+            flattened: list[str] = []
+            for frags in highlights.values():
+                if isinstance(frags, list):
+                    flattened.extend(str(f) for f in frags)
+            highlights = flattened
+        elif not isinstance(highlights, list):
+            highlights = [str(highlights)]
 
-    def _parse_document(self, doc: dict, query: str) -> SDEDocument:
-        """
-        Parse a single document from the SDE API response.
+        normalized = NormalizedDocument(
+            id=_s("id", "_id"),
+            score=float(doc.get("score") or doc.get("_score") or 0.0),
+            index=_s("index", "_index", "api_source"),
+            title=_s("title", "name") or "Untitled",
+            url=_s("url", "readme_url"),
+            division=_s("division"),
+            document_type=_s("document_type", "doc_type"),
+            collection_name=_s("collection_name"),
+            collection_key=_s("collection_key"),
+            full_text=_s("full_text"),
+            data_product_desc=_s("data_product_desc"),
+            relevant_content=_s("relevant_content", "description", "snippet"),
+            highlights=[str(h) for h in highlights],
+            persistent_id=_s("persistent_id", "doi"),
+            pds_lid=_s("pds_lid"),
+            ivo_id=_s("ivo_id"),
+            bps_osdr_id=_s("bps_osdr_id"),
+        )
+        normalize_citation(normalized)
+        return normalized
 
-        Args:
-            doc: Raw document dictionary from the API response
-            query: The search query that produced this result
-
-        Returns:
-            SDEDocument: Parsed and structured document
-        """
-        # Extract core fields
-        score = doc.get("score") or doc.get("_score") or 0.0
-        source_index = doc.get("index") or doc.get("_index") or "unknown"
-
-        # Extract title with multiple fallbacks
-        title = doc.get("title") or doc.get("name") or doc.get("id") or "Untitled"
-
-        # Extract URL with fallbacks
-        url = doc.get("url") or doc.get("readme_url") or ""
-
-        # Extract snippet/description with priority order
-        snippet = (
-            doc.get("full_text")
-            or doc.get("data_product_desc")
-            or doc.get("description")
-            or doc.get("relevant_content")
-            or ""
+    def _failure(
+        self,
+        error_type: SDEErrorType,
+        message: str,
+        agent_next_action: str,
+        retryable: bool,
+    ) -> SDESearchToolOutputSchema:
+        """Build a structured failure payload."""
+        logger.debug(f"sde_search failure [{error_type}]: {message}")
+        return SDESearchToolOutputSchema(
+            success=False,
+            error_type=error_type,
+            message=message,
+            agent_next_action=agent_next_action,
+            retryable=retryable,
+            agent_instruction=_FAILURE_INSTRUCTION,
         )
 
-        # Extract metadata from HitBase common fields
-        division = doc.get("division")
-        doc_type = doc.get("document_type")
+    async def _post(self, client: httpx.AsyncClient, path: str, body: dict) -> httpx.Response:
+        """POST helper (kept separate so retry policy is applied by the caller)."""
+        return await client.post(f"{self.config.base_url}{path}", json=body)
 
-        # Determine source from api_source or index name
-        source = doc.get("api_source") or source_index
+    async def _execute_search(
+        self, client: httpx.AsyncClient, endpoint: SDESearchEndpoint, body: dict
+    ) -> tuple[dict | None, SDESearchToolOutputSchema | None]:
+        """Execute a search request with the retry/recovery policy.
 
-        return SDEDocument(
-            query=query,
-            title=title,
-            content=snippet,
-            score=score,
-            url=url,
-            division=NASASMDDivision(division) if division else None,
-            doc_type=SDEIndexedDocumentType(doc_type) if doc_type else None,
-            source=source,
+        Returns ``(data, None)`` on success or ``(None, failure_payload)`` on error.
+        HTTP 500/503 and timeouts retry once; HTTP 422 vectorization failures are
+        recoverable via keyword search.
+        """
+        path = ENDPOINT_PATHS[endpoint]
+
+        for attempt in range(2):  # initial try + at most one retry for 500/503
+            try:
+                response = await self._post(client, path, body)
+            except httpx.TimeoutException:
+                if attempt == 0:
+                    continue
+                return None, self._failure(
+                    SDEErrorType.RETRYABLE_ERROR,
+                    f"SDE API request timed out after {self.config.timeout}s.",
+                    "Retry later.",
+                    retryable=True,
+                )
+            except httpx.RequestError as e:
+                return None, self._failure(
+                    SDEErrorType.UPSTREAM_ERROR,
+                    f"Could not connect to the SDE API: {e}",
+                    "Check connectivity and retry later.",
+                    retryable=True,
+                )
+
+            status = response.status_code
+            if status < 400:
+                try:
+                    return response.json(), None
+                except ValueError as e:
+                    return None, self._failure(
+                        SDEErrorType.UPSTREAM_ERROR,
+                        f"SDE API returned a non-JSON response: {e}",
+                        "Report the upstream failure.",
+                        retryable=False,
+                    )
+
+            body_text = response.text or ""
+            if status == 400:
+                return None, self._failure(
+                    SDEErrorType.VALIDATION_ERROR,
+                    f"SDE API rejected the request (HTTP 400): {body_text}",
+                    "Correct the request; do not retry unchanged.",
+                    retryable=False,
+                )
+            if status == 422:
+                if "vector" in body_text.lower():
+                    return None, self._failure(
+                        SDEErrorType.RETRYABLE_ERROR,
+                        f"Vectorization failed (HTTP 422): {body_text}",
+                        "Retry using keyword search (search_type='keyword').",
+                        retryable=True,
+                    )
+                return None, self._failure(
+                    SDEErrorType.VALIDATION_ERROR,
+                    f"SDE API schema validation failed (HTTP 422): {body_text}",
+                    "Correct the request schema.",
+                    retryable=False,
+                )
+            if status == 500:
+                if attempt == 0:
+                    continue
+                return None, self._failure(
+                    SDEErrorType.UPSTREAM_ERROR,
+                    f"SDE API internal error (HTTP 500): {body_text}",
+                    "Report the upstream failure.",
+                    retryable=False,
+                )
+            if status == 503:
+                if attempt == 0:
+                    continue
+                return None, self._failure(
+                    SDEErrorType.RETRYABLE_ERROR,
+                    f"SDE API unavailable (HTTP 503): {body_text}",
+                    "Report service unavailability; retry later.",
+                    retryable=True,
+                )
+            # Other 4xx/5xx.
+            return None, self._failure(
+                SDEErrorType.UPSTREAM_ERROR,
+                f"SDE API returned HTTP {status}: {body_text}",
+                "Report the upstream failure.",
+                retryable=status >= 500,
+            )
+
+        # Unreachable: the loop always returns.
+        return None, self._failure(
+            SDEErrorType.UPSTREAM_ERROR, "Search failed unexpectedly.", "Retry later.", retryable=True
         )
+
+    def _build_search_body(self, params: SDESearchToolInputSchema) -> dict:
+        """Assemble the SDE Search API request body from validated input."""
+        body: dict = {
+            "search_term": params.search_term,
+            "page": params.page,
+            "pageSize": params.page_size,
+            "search_type": params.search_type.value,
+            "include_aggregations": params.include_aggregations,
+        }
+        if params.filters:
+            filter_payload = params.filters.to_api_payload()
+            if filter_payload:
+                body["filters"] = filter_payload
+        return body
+
+    @staticmethod
+    def _documents_from_response(data: dict) -> list[dict]:
+        """Extract the raw document list from an SDE response, tolerating shapes."""
+        for key in ("documents", "results", "hits"):
+            docs = data.get(key)
+            if isinstance(docs, list):
+                return docs
+        return []
+
+    # -------------------------------------------------------------------- runner
 
     async def _arun(self, params: SDESearchToolInputSchema) -> SDESearchToolOutputSchema:
-        """Execute SDE search query and return formatted results."""
-        # Calculate fetch size: if URL validation is enabled, fetch more to account for filtering
-        fetch_size = params.limit
-        if self.config.validate_urls:
-            fetch_size = min(int(params.limit * self.config.result_multiplier), 100)
-            logger.debug(
-                f"Fetching {fetch_size} results (limit={params.limit}, multiplier={self.config.result_multiplier})"
-            )
+        """Execute the SDE search and return normalized, citation-ready results."""
+        body = self._build_search_body(params)
+        logger.debug(f"SDE search request ({params.endpoint}): {body}")
 
-        # Build request payload
-        request_body = {
-            "search_term": params.query,
-            "page": 1,
-            "pageSize": fetch_size,
-            "search_type": self.config.search_type,
-        }
-
-        # Add optional filters
-        filters = {}
-        if self.config.division:
-            filters["division"] = [self.config.division.value]
-        if params.doc_type:
-            filters["document_type"] = [params.doc_type.value]
-
-        if filters:
-            request_body["filters"] = filters
-
-        logger.debug(f"Request body for SDE API: {request_body}")
-
-        # Make API request
         async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-            try:
-                response = await client.post(
-                    f"{self.config.base_url}/api/search",
-                    json=request_body,
-                )
-                response.raise_for_status()
-                data = response.json()
-            except httpx.TimeoutException as e:
-                msg = f"SDE API request timed out after {self.config.timeout}s"
-                raise TimeoutError(msg) from e
-            except httpx.HTTPStatusError as e:
-                msg = f"SDE API returned error status {e.response.status_code}: {e.response.text}"
-                raise RuntimeError(msg) from e
-            except Exception as e:
-                msg = f"Failed to query SDE API: {e}"
-                raise RuntimeError(msg) from e
+            data, failure = await self._execute_search(client, params.endpoint, body)
 
-        # Parse response
-        if not data.get("success", False):
-            msg = f"SDE API returned unsuccessful response: {data}"
-            raise RuntimeError(msg)
+        if failure is not None:
+            return failure
 
-        documents = [self._parse_document(doc, params.query) for doc in data.get("documents", [])]
-
-        # Validate URLs if configured
-        if self.config.validate_urls:
-            logger.debug(f"Validating {len(documents)} document URLs")
-            # Check all URLs in parallel using asyncio.gather
-            url_checks = await asyncio.gather(
-                *[self._check_url_exists(doc.url) for doc in documents],
-                return_exceptions=True,
+        assert data is not None
+        if not data.get("success", True) and not self._documents_from_response(data):
+            return self._failure(
+                SDEErrorType.UPSTREAM_ERROR,
+                f"SDE API returned an unsuccessful response: {data}",
+                "Report the upstream failure.",
+                retryable=False,
             )
 
-            # Filter out documents with invalid URLs
-            validated_documents = []
-            for doc, is_valid in zip(documents, url_checks, strict=False):
-                # Handle exceptions as invalid
-                if isinstance(is_valid, Exception):
-                    logger.debug(f"URL validation exception for {doc.url}: {is_valid}")
-                    continue
-                if is_valid:
-                    validated_documents.append(doc)
-                else:
-                    logger.debug(f"Filtered out document with inaccessible URL: {doc.url}")
+        raw_documents = self._documents_from_response(data)
+        if not raw_documents:
+            return self._failure(
+                SDEErrorType.EMPTY_RESULTS,
+                "The search returned no documents.",
+                "Broaden the query, remove filters, or use alternate terminology.",
+                retryable=False,
+            )
 
-            documents = validated_documents
-            logger.debug(f"Retained {len(documents)} documents after URL validation")
-
-        # Limit results to requested limit (in case we fetched more for validation)
-        final_documents = documents[: params.limit]
-
-        if len(documents) > params.limit:
-            logger.debug(f"Truncating {len(documents)} results to requested limit of {params.limit}")
+        documents = [self._parse_document(doc) for doc in raw_documents]
+        total_count = data.get("total_count", data.get("total", len(documents)))
 
         return SDESearchToolOutputSchema(
-            results=final_documents,
-            extra={
-                "total_count": data.get("total_count", 0),
-                "query_used": params.query,
-                "filtered_count": len(final_documents) if self.config.validate_urls else None,
-                "requested_limit": params.limit,
+            success=True,
+            endpoint_used=params.endpoint.value,
+            raw_response=data if isinstance(data, dict) else {},
+            normalized_documents=documents,
+            pagination={
+                "page": params.page,
+                "page_size": params.page_size,
+                "total_count": total_count,
             },
+            aggregations=data.get("aggregations", {}) or {},
+            agent_instruction=_SEARCH_INSTRUCTION,
         )

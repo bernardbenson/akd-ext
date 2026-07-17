@@ -293,7 +293,7 @@ def get_default_code_search_tools() -> list[OpenAITool]:
                 "type": "mcp",
                 "server_label": "CMR_MCP_Server",
                 "allowed_tools": [
-                    "sde_search_tool",
+                    "sde_search",
                     "repository_search_tool",
                     "code_signals_search_tool",
                 ],

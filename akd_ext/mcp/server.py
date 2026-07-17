@@ -51,8 +51,10 @@ def register_tools_manually(tools: list[type[BaseTool]]) -> None:
         register_mcp_tool(mcp_func, mcp)
 
 
-register_all_tools()
-# register_tools_manually(tools=[])  # Add tools here if needed
+# The SDE MCP surface exposes only `sde_search` (see SDE_MCP_Requirements.md §13).
+from akd_ext.tools import SDESearchTool  # noqa: E402
+
+register_tools_manually(tools=[SDESearchTool])
 
 if __name__ == "__main__":
     import argparse
