@@ -105,10 +105,10 @@ def _parse_args() -> argparse.Namespace:
         "(pruned by default; normalized_documents already has every document).",
     )
     parser.add_argument(
-        "--max-full-text-chars",
-        type=int,
-        default=3000,
-        help="Cap on full_text per normalized document; 0 disables full_text (default: 3000).",
+        "--full-text",
+        action="store_true",
+        help="Return complete full_text per normalized document "
+        "(default: capped at 3000 characters with a truncation marker).",
     )
     return parser.parse_args()
 
@@ -127,7 +127,7 @@ async def main() -> None:
         page_size=args.page_size,
         include_aggregations=False,
         include_raw_documents=args.include_raw_documents,
-        max_full_text_chars=args.max_full_text_chars,
+        full_text=args.full_text,
     )
     await run_search(tool, request)
 
