@@ -123,11 +123,7 @@ class NormalizedDocument(BaseModel):
     collection_name: str = Field(default="", description="Collection name.")
     collection_key: str = Field(default="", description="Internal collection key.")
     full_text: str = Field(
-        default="",
-        description=(
-            "Full text or abstract, when available. May be truncated to the request's "
-            "max_full_text_chars; truncation ends with an explicit marker."
-        ),
+        default="", description="Full text or abstract, when available. Never truncated."
     )
     data_product_desc: str = Field(default="", description="Data product description, when available.")
     relevant_content: str = Field(default="", description="Most relevant snippet for the query.")
@@ -192,18 +188,6 @@ def normalize_citation(doc: NormalizedDocument) -> None:
     doc.fallback_used = False
 
 
-def _truncate(text: str, limit: int) -> str:
-    """Cap ``text`` at ``limit`` characters, appending a marker when cut.
-
-    A limit of 0 disables the field entirely.
-    """
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + " …[truncated]"
-
-
 class SDESearchToolConfig(BaseToolConfig):
     """Instance-time configuration for the SDE search tool."""
 
@@ -243,14 +227,6 @@ class SDESearchToolInputSchema(InputSchema):
         description=(
             "Include the verbatim upstream document array in raw_response. Off by default; "
             "normalized_documents already contains every document."
-        ),
-    )
-    max_full_text_chars: int = Field(
-        default=3000,
-        ge=0,
-        description=(
-            "Max characters of full_text per normalized document; 0 disables full_text "
-            "entirely. Truncated text ends with a marker."
         ),
     )
     filters: SDESearchFilters | None = Field(
@@ -328,8 +304,6 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
     - include_raw_documents: include the verbatim upstream document array in raw_response
       (off by default; normalized_documents already contains every document, and
       raw_response otherwise carries upstream metadata only)
-    - max_full_text_chars: cap on full_text per normalized document (default 3000;
-      0 disables full_text; truncation ends with an explicit marker)
     - filters: division, document_type, collection_name, collection_key
                (OR within a list, AND across groups)
 
@@ -353,7 +327,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
 
     # ------------------------------------------------------------------ helpers
 
-    def _parse_document(self, doc: dict, max_full_text_chars: int) -> NormalizedDocument:
+    def _parse_document(self, doc: dict) -> NormalizedDocument:
         """Normalize one raw SDE record and attach citation fields."""
 
         def _s(*keys: str) -> str:
@@ -384,7 +358,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
             document_type=_s("document_type", "doc_type"),
             collection_name=_s("collection_name"),
             collection_key=_s("collection_key"),
-            full_text=_truncate(_s("full_text"), max_full_text_chars),
+            full_text=_s("full_text"),
             data_product_desc=_s("data_product_desc"),
             relevant_content=_s("relevant_content", "description", "snippet"),
             highlights=[str(h) for h in highlights],
@@ -587,9 +561,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                 retryable=False,
             )
 
-        documents = [
-            self._parse_document(doc, params.max_full_text_chars) for doc in raw_documents
-        ]
+        documents = [self._parse_document(doc) for doc in raw_documents]
         total_count = data.get("total_count", data.get("total", len(documents)))
 
         return SDESearchToolOutputSchema(
