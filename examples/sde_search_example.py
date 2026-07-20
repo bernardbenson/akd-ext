@@ -43,6 +43,8 @@ async def run_search(tool: SDESearchTool, request: SDESearchToolInputSchema) -> 
     print(f"endpoint_used:  {result.endpoint_used}")
     print(f"pagination:     {result.pagination}")
     print(f"documents:      {len(result.normalized_documents)}")
+    # Raw documents are pruned from raw_response unless include_raw_documents=True.
+    print(f"raw_response:   keys={sorted(result.raw_response.keys())}")
 
     if not result.success:
         print(f"error_type:     {result.error_type}")
@@ -57,6 +59,7 @@ async def run_search(tool: SDESearchTool, request: SDESearchToolInputSchema) -> 
         print(f"    division:       {doc.division or '-'}")
         print(f"    document_type:  {doc.document_type or '-'}")
         print(f"    score:          {doc.score}")
+        print(f"    full_text:      {len(doc.full_text)} chars")
         # The four citation fields, normalized onto every document.
         print(
             f"    citation:       type={doc.citation_type.value} "
@@ -95,6 +98,18 @@ def _parse_args() -> argparse.Namespace:
         default=5,
         help="Results per page, 1-100 (default: 5).",
     )
+    parser.add_argument(
+        "--include-raw-documents",
+        action="store_true",
+        help="Keep the verbatim upstream document array in raw_response "
+        "(pruned by default; normalized_documents already has every document).",
+    )
+    parser.add_argument(
+        "--max-full-text-chars",
+        type=int,
+        default=3000,
+        help="Cap on full_text per normalized document; 0 disables full_text (default: 3000).",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +126,8 @@ async def main() -> None:
         page=1,
         page_size=args.page_size,
         include_aggregations=False,
+        include_raw_documents=args.include_raw_documents,
+        max_full_text_chars=args.max_full_text_chars,
     )
     await run_search(tool, request)
 

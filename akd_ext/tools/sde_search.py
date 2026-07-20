@@ -122,7 +122,13 @@ class NormalizedDocument(BaseModel):
     document_type: str = Field(default="", description="Document type.")
     collection_name: str = Field(default="", description="Collection name.")
     collection_key: str = Field(default="", description="Internal collection key.")
-    full_text: str = Field(default="", description="Full text or abstract, when available.")
+    full_text: str = Field(
+        default="",
+        description=(
+            "Full text or abstract, when available. May be truncated to the request's "
+            "max_full_text_chars; truncation ends with an explicit marker."
+        ),
+    )
     data_product_desc: str = Field(default="", description="Data product description, when available.")
     relevant_content: str = Field(default="", description="Most relevant snippet for the query.")
     highlights: list[str] = Field(default_factory=list, description="Highlighted matching fragments.")
@@ -186,6 +192,18 @@ def normalize_citation(doc: NormalizedDocument) -> None:
     doc.fallback_used = False
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` characters, appending a marker when cut.
+
+    A limit of 0 disables the field entirely.
+    """
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[truncated]"
+
+
 class SDESearchToolConfig(BaseToolConfig):
     """Instance-time configuration for the SDE search tool."""
 
@@ -220,6 +238,21 @@ class SDESearchToolInputSchema(InputSchema):
     include_aggregations: bool = Field(
         default=False, description="Request aggregation metadata when available."
     )
+    include_raw_documents: bool = Field(
+        default=False,
+        description=(
+            "Include the verbatim upstream document array in raw_response. Off by default; "
+            "normalized_documents already contains every document."
+        ),
+    )
+    max_full_text_chars: int = Field(
+        default=3000,
+        ge=0,
+        description=(
+            "Max characters of full_text per normalized document; 0 disables full_text "
+            "entirely. Truncated text ends with a marker."
+        ),
+    )
     filters: SDESearchFilters | None = Field(
         default=None, description="Optional result filters (OR within a list, AND across groups)."
     )
@@ -244,7 +277,13 @@ class SDESearchToolOutputSchema(OutputSchema):
 
     # --- Success ---
     endpoint_used: str = Field(default="", description="Endpoint value the search executed against.")
-    raw_response: dict = Field(default_factory=dict, description="Unmodified upstream response body.")
+    raw_response: dict = Field(
+        default_factory=dict,
+        description=(
+            "Upstream response metadata. The document array and keys duplicated at the top "
+            "level (pagination, aggregations) are pruned unless include_raw_documents=True."
+        ),
+    )
     normalized_documents: list[NormalizedDocument] = Field(
         default_factory=list, description="Documents normalized into the stable contract."
     )
@@ -260,8 +299,9 @@ class SDESearchToolOutputSchema(OutputSchema):
 
 _SEARCH_INSTRUCTION = (
     "Use normalized_documents for reasoning, summarization, comparison, and citation. "
-    "Prefer complete or fallback citations. Inspect raw_response only when source-specific "
-    "fields are required."
+    "Prefer complete or fallback citations. raw_response holds upstream metadata only; "
+    "raw documents are omitted unless the search was run with include_raw_documents=True. "
+    "Re-run with that flag only when source-specific raw fields are required."
 )
 _FAILURE_INSTRUCTION = (
     "Do not fabricate search results or citation identifiers. Follow the recommended recovery action."
@@ -285,6 +325,11 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
     - search_type: hybrid (default) | keyword | vector
     - page / page_size: pagination (page >= 1, page_size 1-100)
     - include_aggregations: request aggregation metadata when available
+    - include_raw_documents: include the verbatim upstream document array in raw_response
+      (off by default; normalized_documents already contains every document, and
+      raw_response otherwise carries upstream metadata only)
+    - max_full_text_chars: cap on full_text per normalized document (default 3000;
+      0 disables full_text; truncation ends with an explicit marker)
     - filters: division, document_type, collection_name, collection_key
                (OR within a list, AND across groups)
 
@@ -308,7 +353,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
 
     # ------------------------------------------------------------------ helpers
 
-    def _parse_document(self, doc: dict) -> NormalizedDocument:
+    def _parse_document(self, doc: dict, max_full_text_chars: int) -> NormalizedDocument:
         """Normalize one raw SDE record and attach citation fields."""
 
         def _s(*keys: str) -> str:
@@ -339,7 +384,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
             document_type=_s("document_type", "doc_type"),
             collection_name=_s("collection_name"),
             collection_key=_s("collection_key"),
-            full_text=_s("full_text"),
+            full_text=_truncate(_s("full_text"), max_full_text_chars),
             data_product_desc=_s("data_product_desc"),
             relevant_content=_s("relevant_content", "description", "snippet"),
             highlights=[str(h) for h in highlights],
@@ -493,6 +538,24 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                 return docs
         return []
 
+    @staticmethod
+    def _prune_raw_response(data: dict) -> dict:
+        """Upstream body minus keys duplicated at the top level of the output.
+
+        The document array is fully represented by ``normalized_documents``;
+        pagination/aggregations/totals are surfaced as top-level output fields.
+        """
+        duplicated = (
+            "documents",
+            "results",
+            "hits",
+            "pagination",
+            "aggregations",
+            "total_count",
+            "total",
+        )
+        return {k: v for k, v in data.items() if k not in duplicated}
+
     # -------------------------------------------------------------------- runner
 
     async def _arun(self, params: SDESearchToolInputSchema) -> SDESearchToolOutputSchema:
@@ -510,7 +573,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
         if not data.get("success", True) and not self._documents_from_response(data):
             return self._failure(
                 SDEErrorType.UPSTREAM_ERROR,
-                f"SDE API returned an unsuccessful response: {data}",
+                f"SDE API returned an unsuccessful response: {str(data)[:500]}",
                 "Report the upstream failure.",
                 retryable=False,
             )
@@ -524,13 +587,19 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                 retryable=False,
             )
 
-        documents = [self._parse_document(doc) for doc in raw_documents]
+        documents = [
+            self._parse_document(doc, params.max_full_text_chars) for doc in raw_documents
+        ]
         total_count = data.get("total_count", data.get("total", len(documents)))
 
         return SDESearchToolOutputSchema(
             success=True,
             endpoint_used=params.endpoint.value,
-            raw_response=data if isinstance(data, dict) else {},
+            raw_response=(
+                (data if params.include_raw_documents else self._prune_raw_response(data))
+                if isinstance(data, dict)
+                else {}
+            ),
             normalized_documents=documents,
             pagination={
                 "page": params.page,
