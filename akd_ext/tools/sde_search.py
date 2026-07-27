@@ -349,7 +349,7 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
             highlights = [str(highlights)]
 
         normalized = NormalizedDocument(
-            id=_s("id", "_id"),
+            id=str(doc.get("_id") or ""),
             score=float(doc.get("score") or doc.get("_score") or 0.0),
             index=_s("index", "_index", "api_source"),
             title=_s("title", "name") or "Untitled",
