@@ -194,7 +194,7 @@ class SDESearchToolConfig(BaseToolConfig):
     name: str = Field(default="sde_search", description="MCP tool name.")
     base_url: str = Field(
         default=os.getenv(
-            "SDE_BASE_URL", "https://science.data.nasa.gov/science-discovery-engine"
+            "SDE_BASE_URL", "https://dyejsbdumgpqz.cloudfront.net"
         ),
         description="Base URL for the SDE Search API (endpoint paths like /api/search are appended).",
     )
