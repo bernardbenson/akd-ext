@@ -17,20 +17,28 @@ Design notes:
 - The tool never fabricates results or identifiers. Upstream and validation failures
   are returned as a structured payload (``success=false``) rather than raised past the
   MCP boundary, so the agent-facing contract stays stable and actionable.
+- Responses are size-bounded end to end. ``full_text`` is unbounded per document and both
+  the SDE API and the MCP host cap a response at 6 MiB, so a single page can exceed the
+  limit. The tool emits ``structuredContent`` only (see ``as_function``) instead of the
+  duplicated payload FastMCP produces by default, refetches an oversized window in smaller
+  aligned pages, and — only if it still does not fit — drops ``full_text`` from the largest
+  documents. Documents are never silently dropped.
 
 Boundaries: summarization, query rewriting, acronym expansion, ranking, and internal
 registry operations live in the agent/application layer, not in this tool.
 """
 
+import json
 import os
 import re
+from typing import Literal, NamedTuple
 
 import httpx
-from loguru import logger
-from pydantic import BaseModel, Field, model_validator
-
 from akd._base import InputSchema, OutputSchema
 from akd.tools import BaseTool, BaseToolConfig
+from fastmcp.tools.tool import ToolResult
+from loguru import logger
+from pydantic import BaseModel, Field, model_validator
 
 from akd_ext.mcp import mcp_tool
 from akd_ext.structures import (
@@ -55,6 +63,56 @@ ENDPOINT_PATHS: dict[SDESearchEndpoint, str] = {
     SDESearchEndpoint.OSDR: "/api/osdr/search",
     SDESearchEndpoint.CODE: "/api/code/search",
 }
+
+# Statuses worth one immediate replay before giving up or splitting the window.
+_RETRY_ONCE_STATUSES = frozenset({500, 502, 503})
+
+# Sentinel status for "HTTP 200 but the body did not parse" — a response truncated in
+# transit. Not a real status code, so it cannot collide with one.
+_TRUNCATED_RESPONSE = -1
+
+# Failures that mean "this window was too large to deliver". Both the SDE API and the MCP
+# host cap a response at 6 MiB: the API answers 502 with `{"message": "Internal server
+# error"}`, and a partially delivered body fails to parse. Either way the same window
+# succeeds when fetched in smaller pieces.
+_SPLIT_STATUSES = frozenset({502, _TRUNCATED_RESPONSE})
+
+class _ErrorPolicy(NamedTuple):
+    """How one upstream status maps onto the tool's failure contract.
+
+    ``message`` is a template over ``{status}`` and ``{body}``.
+    """
+
+    error_type: SDEErrorType
+    message: str
+    next_action: str
+    retryable: bool
+
+
+_ERROR_POLICIES: dict[int, _ErrorPolicy] = {
+    400: _ErrorPolicy(SDEErrorType.VALIDATION_ERROR, "SDE API rejected the request (HTTP {status}): {body}",
+                      "Correct the request; do not retry unchanged.", False),
+    422: _ErrorPolicy(SDEErrorType.VALIDATION_ERROR, "SDE API schema validation failed (HTTP {status}): {body}",
+                      "Correct the request schema.", False),
+    500: _ErrorPolicy(SDEErrorType.UPSTREAM_ERROR, "SDE API internal error (HTTP {status}): {body}",
+                      "Report the upstream failure.", False),
+    502: _ErrorPolicy(SDEErrorType.RETRYABLE_ERROR, "SDE API bad gateway (HTTP {status}): {body}",
+                      "Retry with a smaller page_size; the response likely exceeded the upstream payload limit.", True),
+    503: _ErrorPolicy(SDEErrorType.RETRYABLE_ERROR, "SDE API unavailable (HTTP {status}): {body}",
+                      "Report service unavailability; retry later.", True),
+}
+
+# A 422 naming vectorization is recoverable by rerunning as keyword search, so it overrides
+# the generic 422 policy above.
+_VECTORIZATION_POLICY = _ErrorPolicy(SDEErrorType.RETRYABLE_ERROR, "Vectorization failed (HTTP {status}): {body}",
+                                     "Retry using keyword search (search_type='keyword').", True)
+
+
+def _unexpected_status_policy(status: int) -> _ErrorPolicy:
+    """Fallback for any 4xx/5xx the contract does not name explicitly."""
+    return _ErrorPolicy(SDEErrorType.UPSTREAM_ERROR, "SDE API returned HTTP {status}: {body}",
+                        "Report the upstream failure.", status >= 500)
+
 
 # A DOI is `10.<registrant>/<suffix>`, optionally wrapped in a URL/`doi:` prefix.
 # The suffix stops at whitespace or a `;`/`,` delimiter — some SDE persistent_id
@@ -123,7 +181,20 @@ class NormalizedDocument(BaseModel):
     collection_name: str = Field(default="", description="Collection name.")
     collection_key: str = Field(default="", description="Internal collection key.")
     full_text: str = Field(
-        default="", description="Full text or abstract, when available. Never truncated."
+        default="",
+        description=(
+            "Full text or abstract, when available. Never truncated; it is dropped whole "
+            "(and flagged by full_text_omitted) only when the response would otherwise "
+            "exceed its size budget."
+        ),
+    )
+    full_text_omitted: bool = Field(
+        default=False,
+        description="True when full_text was dropped to keep the response within its size budget.",
+    )
+    full_text_chars: int = Field(
+        default=0,
+        description="Length of the dropped full_text; 0 unless full_text_omitted is true.",
     )
     data_product_desc: str = Field(default="", description="Data product description, when available.")
     relevant_content: str = Field(default="", description="Most relevant snippet for the query.")
@@ -199,6 +270,15 @@ class SDESearchToolConfig(BaseToolConfig):
         description="Base URL for the SDE Search API (endpoint paths like /api/search are appended).",
     )
     timeout: float = Field(default=30.0, description="HTTP request timeout in seconds.")
+    max_response_bytes: int = Field(
+        default=5_000_000,
+        description=(
+            "Size budget for the serialized document payload. Both the SDE API and the MCP "
+            "host cap a response at 6 MiB; this leaves headroom under that. When the payload "
+            "is larger, full_text is dropped from the biggest documents until it fits. "
+            "0 disables the guard."
+        ),
+    )
 
 
 class SDESearchToolInputSchema(InputSchema):
@@ -296,16 +376,8 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
     Executes keyword, vector, or hybrid retrieval against the cross-source `generic`
     endpoint or a caller-selected source endpoint, and returns documents normalized into
     a stable contract. Citation normalization runs automatically for every document.
-    - search_term: the query (required, non-blank)
-    - endpoint: generic | web | cmr | pds3 | pds4 | spase | gcn | hek | navo | osdr | code
-    - search_type: hybrid (default) | keyword | vector
-    - page / page_size: pagination (page >= 1, page_size 1-100)
-    - include_aggregations: request aggregation metadata when available
-    - include_raw_documents: include the verbatim upstream document array in raw_response
-      (off by default; normalized_documents already contains every document, and
-      raw_response otherwise carries upstream metadata only)
-    - filters: division, document_type, collection_name, collection_key
-               (OR within a list, AND across groups)
+    Parameters are described under INPUT FIELD DESCRIPTIONS below, which the framework
+    appends from the input schema.
 
     Every normalized document includes four citation fields, selected deterministically
     in this order: DOI, pds_lid, ivo_id, bps_osdr_id, url, missing.
@@ -394,16 +466,18 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
 
     async def _execute_search(
         self, client: httpx.AsyncClient, endpoint: SDESearchEndpoint, body: dict
-    ) -> tuple[dict | None, SDESearchToolOutputSchema | None]:
+    ) -> tuple[dict | None, SDESearchToolOutputSchema | None, int | None]:
         """Execute a search request with the retry/recovery policy.
 
-        Returns ``(data, None)`` on success or ``(None, failure_payload)`` on error.
-        HTTP 500/503 and timeouts retry once; HTTP 422 vectorization failures are
-        recoverable via keyword search.
+        Returns ``(data, None, status)`` on success or ``(None, failure_payload, status)``
+        on error; ``status`` is ``None`` when no response was received. HTTP 500/502/503
+        and timeouts retry once; HTTP 422 vectorization failures are recoverable via
+        keyword search. The caller uses ``status`` to decide whether the window is worth
+        splitting (see ``_search_window``).
         """
         path = ENDPOINT_PATHS[endpoint]
 
-        for attempt in range(2):  # initial try + at most one retry for 500/503
+        for attempt in range(2):  # initial try + at most one retry for 500/502/503
             try:
                 response = await self._post(client, path, body)
             except httpx.TimeoutException:
@@ -414,79 +488,47 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                     f"SDE API request timed out after {self.config.timeout}s.",
                     "Retry later.",
                     retryable=True,
-                )
+                ), None
             except httpx.RequestError as e:
                 return None, self._failure(
                     SDEErrorType.UPSTREAM_ERROR,
                     f"Could not connect to the SDE API: {e}",
                     "Check connectivity and retry later.",
                     retryable=True,
-                )
+                ), None
 
             status = response.status_code
             if status < 400:
                 try:
-                    return response.json(), None
+                    return response.json(), None, status
                 except ValueError as e:
+                    # A response cut off mid-transfer lands here; splitting the window
+                    # shrinks it enough to arrive whole.
                     return None, self._failure(
                         SDEErrorType.UPSTREAM_ERROR,
                         f"SDE API returned a non-JSON response: {e}",
-                        "Report the upstream failure.",
-                        retryable=False,
-                    )
+                        "Retry with a smaller page_size.",
+                        retryable=True,
+                    ), _TRUNCATED_RESPONSE
+
+            if status in _RETRY_ONCE_STATUSES and attempt == 0:
+                continue
 
             body_text = response.text or ""
-            if status == 400:
-                return None, self._failure(
-                    SDEErrorType.VALIDATION_ERROR,
-                    f"SDE API rejected the request (HTTP 400): {body_text}",
-                    "Correct the request; do not retry unchanged.",
-                    retryable=False,
-                )
-            if status == 422:
-                if "vector" in body_text.lower():
-                    return None, self._failure(
-                        SDEErrorType.RETRYABLE_ERROR,
-                        f"Vectorization failed (HTTP 422): {body_text}",
-                        "Retry using keyword search (search_type='keyword').",
-                        retryable=True,
-                    )
-                return None, self._failure(
-                    SDEErrorType.VALIDATION_ERROR,
-                    f"SDE API schema validation failed (HTTP 422): {body_text}",
-                    "Correct the request schema.",
-                    retryable=False,
-                )
-            if status == 500:
-                if attempt == 0:
-                    continue
-                return None, self._failure(
-                    SDEErrorType.UPSTREAM_ERROR,
-                    f"SDE API internal error (HTTP 500): {body_text}",
-                    "Report the upstream failure.",
-                    retryable=False,
-                )
-            if status == 503:
-                if attempt == 0:
-                    continue
-                return None, self._failure(
-                    SDEErrorType.RETRYABLE_ERROR,
-                    f"SDE API unavailable (HTTP 503): {body_text}",
-                    "Report service unavailability; retry later.",
-                    retryable=True,
-                )
-            # Other 4xx/5xx.
+            policy = _ERROR_POLICIES.get(status) or _unexpected_status_policy(status)
+            if status == 422 and "vector" in body_text.lower():
+                policy = _VECTORIZATION_POLICY
             return None, self._failure(
-                SDEErrorType.UPSTREAM_ERROR,
-                f"SDE API returned HTTP {status}: {body_text}",
-                "Report the upstream failure.",
-                retryable=status >= 500,
-            )
+                policy.error_type,
+                policy.message.format(status=status, body=body_text),
+                policy.next_action,
+                retryable=policy.retryable,
+            ), status
 
         # Unreachable: the loop always returns.
         return None, self._failure(
             SDEErrorType.UPSTREAM_ERROR, "Search failed unexpectedly.", "Retry later.", retryable=True
-        )
+        ), None
 
     def _build_search_body(self, params: SDESearchToolInputSchema) -> dict:
         """Assemble the SDE Search API request body from validated input."""
@@ -530,21 +572,157 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
         )
         return {k: v for k, v in data.items() if k not in duplicated}
 
+    @staticmethod
+    def _sub_window_sizes(page_size: int) -> list[int]:
+        """Sub-window sizes to try when a window is too large, largest first.
+
+        Only divisors of ``page_size`` qualify. The window starts at absolute rank
+        ``(page - 1) * page_size``, which is a multiple of every divisor, so sub-pages tile
+        the window exactly — no document is skipped or repeated. 1 is the last resort.
+        """
+        sizes: list[int] = []
+        size = page_size // 2
+        while size >= 1:
+            if page_size % size == 0:
+                sizes.append(size)
+            size //= 2
+        if 1 not in sizes and page_size > 1:
+            sizes.append(1)
+        return sizes
+
+    async def _fetch_split(
+        self,
+        client: httpx.AsyncClient,
+        params: SDESearchToolInputSchema,
+        sub_size: int,
+    ) -> tuple[list[dict] | None, dict | None, SDESearchToolOutputSchema | None]:
+        """Refetch the requested window as consecutive ``sub_size`` pages and concatenate.
+
+        Returns ``(raw_documents, merged_response, None)`` or ``(None, None, failure)``.
+        Rank order is preserved, so the caller's page contract is unchanged.
+        """
+        offset = (params.page - 1) * params.page_size
+        first_page = offset // sub_size + 1
+
+        documents: list[dict] = []
+        last_data: dict | None = None
+        for index in range(params.page_size // sub_size):
+            body = self._build_search_body(params)
+            body["page"] = first_page + index
+            body["pageSize"] = sub_size
+            data, failure, _ = await self._execute_search(client, params.endpoint, body)
+            if failure is not None:
+                return None, None, failure
+            last_data = data
+            page_docs = self._documents_from_response(data or {})
+            documents.extend(page_docs)
+            if len(page_docs) < sub_size:
+                break  # ran off the end of the result set
+
+        # Re-key the merged body so raw_response describes the whole window, not just the
+        # last sub-page it happened to end on.
+        merged = {
+            k: v
+            for k, v in (last_data or {}).items()
+            if k not in ("documents", "results", "hits")
+        }
+        merged["documents"] = documents
+        return documents, merged, None
+
+    async def _search_window(
+        self, client: httpx.AsyncClient, params: SDESearchToolInputSchema
+    ) -> tuple[list[dict] | None, dict | None, SDESearchToolOutputSchema | None]:
+        """Fetch the requested page, splitting it into sub-windows when it is too large."""
+        body = self._build_search_body(params)
+        data, failure, status = await self._execute_search(client, params.endpoint, body)
+        if failure is None:
+            return self._documents_from_response(data or {}), data, None
+        if status not in _SPLIT_STATUSES:
+            return None, None, failure
+
+        for sub_size in self._sub_window_sizes(params.page_size):
+            logger.debug(
+                f"sde_search: page {params.page} (size {params.page_size}) was too large to "
+                f"deliver; refetching it in pages of {sub_size}"
+            )
+            documents, merged, failure = await self._fetch_split(client, params, sub_size)
+            if failure is None:
+                return documents, merged, None
+        return None, None, failure
+
+    def _apply_response_budget(self, documents: list[NormalizedDocument]) -> int:
+        """Drop ``full_text`` from the largest documents until the payload fits its budget.
+
+        Documents themselves are never dropped — only their text, and only from the biggest
+        ones — so the page contract holds and the caller can refetch an elided document on
+        its own. Returns how many were elided.
+        """
+        limit = self.config.max_response_bytes
+        if limit <= 0 or not documents:
+            return 0
+
+        payload_bytes = len(
+            json.dumps([doc.model_dump(mode="json") for doc in documents], default=str)
+        )
+        if payload_bytes <= limit:
+            return 0
+
+        elided = 0
+        for doc in sorted(documents, key=lambda d: len(d.full_text), reverse=True):
+            if payload_bytes <= limit or not doc.full_text:
+                break
+            payload_bytes -= len(doc.full_text)
+            doc.full_text_chars = len(doc.full_text)
+            doc.full_text = ""
+            doc.full_text_omitted = True
+            elided += 1
+        logger.debug(f"sde_search: dropped full_text from {elided} document(s) to fit the budget")
+        return elided
+
+    # ------------------------------------------------------------- MCP integration
+
+    def as_function(self, mode: Literal["python", "json"] | None = None):
+        """Return the MCP callable, emitting ``structuredContent`` only.
+
+        ``mode`` is accepted for signature compatibility and ignored — this override owns
+        the serialization the base class's ``mode`` would otherwise select.
+
+        FastMCP's default conversion serializes a tool's return value into a text content
+        block *and* copies it into ``structuredContent``, so every response ships the whole
+        payload twice. With `full_text` included that doubling is what pushes large pages
+        past the 6 MiB response limit. Returning a ``ToolResult`` short-circuits that
+        conversion.
+
+        ``content`` must be passed explicitly: ``ToolResult`` treats ``content=None`` as
+        "derive it from structured_content", which reinstates the duplication. The return
+        annotation stays the output schema so MCP still advertises ``outputSchema``.
+        """
+        inner = super().as_function(mode=None)
+
+        async def wrapper(*args, **kwargs) -> ToolResult:
+            result = await inner(*args, **kwargs)
+            return ToolResult(content=[], structured_content=result.model_dump(mode="json"))
+
+        wrapper.__name__ = inner.__name__
+        wrapper.__doc__ = inner.__doc__
+        wrapper.__signature__ = inner.__signature__
+        wrapper.__annotations__ = dict(inner.__annotations__)
+        return wrapper
+
     # -------------------------------------------------------------------- runner
 
     async def _arun(self, params: SDESearchToolInputSchema) -> SDESearchToolOutputSchema:
         """Execute the SDE search and return normalized, citation-ready results."""
-        body = self._build_search_body(params)
-        logger.debug(f"SDE search request ({params.endpoint}): {body}")
+        logger.debug(f"SDE search request ({params.endpoint}): {self._build_search_body(params)}")
 
         async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-            data, failure = await self._execute_search(client, params.endpoint, body)
+            raw_documents, data, failure = await self._search_window(client, params)
 
         if failure is not None:
             return failure
 
-        assert data is not None
-        if not data.get("success", True) and not self._documents_from_response(data):
+        data = data or {}
+        if not data.get("success", True) and not raw_documents:
             return self._failure(
                 SDEErrorType.UPSTREAM_ERROR,
                 f"SDE API returned an unsuccessful response: {str(data)[:500]}",
@@ -552,7 +730,6 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                 retryable=False,
             )
 
-        raw_documents = self._documents_from_response(data)
         if not raw_documents:
             return self._failure(
                 SDEErrorType.EMPTY_RESULTS,
@@ -562,7 +739,16 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
             )
 
         documents = [self._parse_document(doc) for doc in raw_documents]
+        omitted = self._apply_response_budget(documents)
         total_count = data.get("total_count", data.get("total", len(documents)))
+
+        instruction = _SEARCH_INSTRUCTION
+        if omitted:
+            instruction += (
+                f" full_text was dropped from {omitted} oversized document(s) to keep this "
+                "response within its size limit; those documents carry full_text_omitted=true "
+                "and can be refetched individually with page_size=1."
+            )
 
         return SDESearchToolOutputSchema(
             success=True,
@@ -579,5 +765,5 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
                 "total_count": total_count,
             },
             aggregations=data.get("aggregations", {}) or {},
-            agent_instruction=_SEARCH_INSTRUCTION,
+            agent_instruction=instruction,
         )
