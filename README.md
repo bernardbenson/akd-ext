@@ -5,6 +5,7 @@ Misc extension to [akd-core](https://github.com/NASA-IMPACT/accelerated-discover
 ## Documentation
 
 - [Creating Agents](docs/development/creating_agents.md) — guide for building new agents on `OpenAIBaseAgent` or `PydanticAIBaseAgent`, including config, schemas, tools, capabilities, tests, and reference examples.
+- [SDE Search Tool](docs/tools/sde_search.md) — reference for `sde_search`, the NASA Science Discovery Engine MCP search tool: endpoints, filters, input/output schemas, citation normalization, error contract, and response size handling.
 
 ## Installation
 

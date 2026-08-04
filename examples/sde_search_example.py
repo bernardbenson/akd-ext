@@ -59,7 +59,10 @@ async def run_search(tool: SDESearchTool, request: SDESearchToolInputSchema) -> 
         print(f"    division:       {doc.division or '-'}")
         print(f"    document_type:  {doc.document_type or '-'}")
         print(f"    score:          {doc.score}")
-        print(f"    full_text:      {len(doc.full_text)} chars")
+        if doc.full_text_omitted:
+            print(f"    full_text:      omitted ({doc.full_text_chars} chars; refetch with page_size=1)")
+        else:
+            print(f"    full_text:      {len(doc.full_text)} chars")
         # The four citation fields, normalized onto every document.
         print(
             f"    citation:       type={doc.citation_type.value} "
@@ -104,12 +107,6 @@ def _parse_args() -> argparse.Namespace:
         help="Keep the verbatim upstream document array in raw_response "
         "(pruned by default; normalized_documents already has every document).",
     )
-    parser.add_argument(
-        "--full-text",
-        action="store_true",
-        help="Return complete full_text per normalized document "
-        "(default: capped at 3000 characters with a truncation marker).",
-    )
     return parser.parse_args()
 
 
@@ -127,7 +124,6 @@ async def main() -> None:
         page_size=args.page_size,
         include_aggregations=False,
         include_raw_documents=args.include_raw_documents,
-        full_text=args.full_text,
     )
     await run_search(tool, request)
 
