@@ -64,7 +64,7 @@ Transport, host, and port can also be set via the `MCP_TRANSPORT`, `MCP_HOST`, a
 | Field | Default | Description |
 |---|---|---|
 | `name` | `"sde_search"` | MCP tool name. |
-| `base_url` | `$SDE_BASE_URL`, else `https://dyejsbdumgpqz.cloudfront.net` | Base URL for the SDE Search API; endpoint paths like `/api/search` are appended. |
+| `base_url` | `$SDE_BASE_URL`, else `https://science.data.nasa.gov/science-discovery-engine` | Base URL for the SDE Search API; endpoint paths like `/api/search` are appended. |
 | `timeout` | `30.0` | HTTP request timeout in seconds. |
 | `max_response_bytes` | `5_000_000` | Size budget for the serialized document payload (headroom under the 6 MiB API/MCP cap). `0` disables the guard. |
 
